@@ -79,8 +79,12 @@ class TokenEncoder(nn.Module):
         self,
         instance,
         state: CPDState,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Encode the global context token."""
+        if device is None:
+            device = next(self.parameters()).device
+            
         # Compute progress (fraction of expected tasks added)
         expected_tasks = sum(
             instance.get_aircraft(i).max_A_checks(instance.horizon) +
@@ -94,7 +98,7 @@ class TokenEncoder(nn.Module):
             instance.capacity / 5.0,   # Normalize to ~1
             instance.n_aircraft / 20.0,  # Normalize to ~1
             progress,
-        ], dtype=torch.float32)
+        ], dtype=torch.float32, device=device)
         
         embed = self.global_embed + self.global_mlp(features)
         return embed
@@ -104,8 +108,12 @@ class TokenEncoder(nn.Module):
         instance,
         state: CPDState,
         aircraft_id: int,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Encode an aircraft context token."""
+        if device is None:
+            device = next(self.parameters()).device
+            
         ac = instance.get_aircraft(aircraft_id)
         
         # Normalize features
@@ -118,10 +126,10 @@ class TokenEncoder(nn.Module):
             ac.C_tolerance / 30.0,
             state.get_task_count(aircraft_id) / 20.0,
             instance.max_tasks_for_aircraft(aircraft_id) / 50.0,
-        ], dtype=torch.float32)
+        ], dtype=torch.float32, device=device)
         
         embed = (
-            self.aircraft_embed(torch.tensor(aircraft_id)) +
+            self.aircraft_embed(torch.tensor(aircraft_id, device=device)) +
             self.aircraft_mlp(features)
         )
         return embed
@@ -130,8 +138,12 @@ class TokenEncoder(nn.Module):
         self,
         instance,
         task: TaskNode,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Encode a task token."""
+        if device is None:
+            device = next(self.parameters()).device
+            
         horizon = instance.horizon
         
         features = torch.tensor([
@@ -139,15 +151,15 @@ class TokenEncoder(nn.Module):
             task.earliest_day / horizon,
             task.latest_day / horizon,
             (task.latest_day - task.earliest_day) / horizon,  # Flexibility
-        ], dtype=torch.float32)
+        ], dtype=torch.float32, device=device)
         
         check_type_idx = 0 if task.check_type == 'A' else 1
         seq_idx = min(task.sequence_index, 19)  # Clamp to embedding size
         
         embed = (
-            self.aircraft_embed(torch.tensor(task.aircraft_id)) +
-            self.check_type_embed(torch.tensor(check_type_idx)) +
-            self.seq_index_embed(torch.tensor(seq_idx)) +
+            self.aircraft_embed(torch.tensor(task.aircraft_id, device=device)) +
+            self.check_type_embed(torch.tensor(check_type_idx, device=device)) +
+            self.seq_index_embed(torch.tensor(seq_idx, device=device)) +
             self.task_mlp(features)
         )
         return embed
@@ -182,15 +194,15 @@ class TokenEncoder(nn.Module):
         embeddings = []
         
         # Global token
-        embeddings.append(self.encode_global(instance, state))
+        embeddings.append(self.encode_global(instance, state, device))
         
         # Aircraft tokens
         for i in range(n_aircraft):
-            embeddings.append(self.encode_aircraft(instance, state, i))
+            embeddings.append(self.encode_aircraft(instance, state, i, device))
         
         # Task tokens
         for task in state.nodes:
-            embeddings.append(self.encode_task(instance, task))
+            embeddings.append(self.encode_task(instance, task, device))
         
         # Stack embeddings
         embeddings = torch.stack(embeddings, dim=0).to(device)  # [seq_len, d_model]

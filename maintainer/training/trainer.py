@@ -4,12 +4,19 @@ Behavior Cloning Trainer for Maintainer.
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import math
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 from maintainer.core.model import MaintainerNet, ModelConfig, PolicyLogits
 from maintainer.core.state import CPDState, Action, ActionType
@@ -37,8 +44,19 @@ class TrainingConfig:
     # Logging
     log_interval: int = 10
     
+    # Checkpointing
+    checkpoint_dir: Optional[str] = None
+    checkpoint_interval: int = 1  # Save every N epochs
+    resume_from: Optional[str] = None  # Path to checkpoint to resume from
+    
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Weights & Biases
+    use_wandb: bool = True
+    wandb_project: str = "maintainer-v1"
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
 
 
 class BCTrainer:
@@ -53,12 +71,18 @@ class BCTrainer:
         self,
         model: MaintainerNet,
         config: TrainingConfig,
+        model_config: Optional[ModelConfig] = None,
     ):
         self.model = model
         self.config = config
         self.device = torch.device(config.device)
+        self.wandb_run = None
         
         self.model.to(self.device)
+        
+        # Initialize wandb if available and enabled
+        if config.use_wandb and WANDB_AVAILABLE:
+            self._init_wandb(model_config)
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -77,6 +101,49 @@ class BCTrainer:
             'value_loss': [],
             'policy_accuracy': [],
         }
+    
+    def _init_wandb(self, model_config: Optional[ModelConfig] = None):
+        """Initialize Weights & Biases logging."""
+        # Load .env if exists
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+        
+        # Build config dict for wandb
+        wandb_config = {
+            "lr": self.config.lr,
+            "weight_decay": self.config.weight_decay,
+            "batch_size": self.config.batch_size,
+            "n_epochs": self.config.n_epochs,
+            "grad_clip": self.config.grad_clip,
+            "policy_weight": self.config.policy_weight,
+            "value_weight": self.config.value_weight,
+            "device": self.config.device,
+        }
+        
+        if model_config:
+            wandb_config.update({
+                "d_model": model_config.d_model,
+                "n_layers": model_config.n_layers,
+                "n_heads": model_config.n_heads,
+                "max_aircraft": model_config.max_aircraft,
+            })
+        
+        # Count model parameters
+        wandb_config["n_parameters"] = sum(p.numel() for p in self.model.parameters())
+        
+        self.wandb_run = wandb.init(
+            project=self.config.wandb_project,
+            name=self.config.wandb_run_name,
+            entity=self.config.wandb_entity,
+            config=wandb_config,
+            reinit=True,
+        )
+        
+        # Watch model for gradient logging
+        wandb.watch(self.model, log="gradients", log_freq=100)
     
     def compute_loss(
         self,
@@ -130,8 +197,12 @@ class BCTrainer:
             # p(AddTask(i, C)) = p(type=C) * p(aircraft=i)
             # p(Stop) = p(type=Stop)
             
-            type_log_probs = F.log_softmax(policy.type, dim=-1)
-            aircraft_log_probs = F.log_softmax(policy.aircraft, dim=-1)
+            # Clamp logits for numerical stability before log_softmax
+            type_logits_clamped = policy.type.clamp(-50, 50)
+            aircraft_logits_clamped = policy.aircraft.clamp(-50, 50)
+            
+            type_log_probs = F.log_softmax(type_logits_clamped, dim=-1)
+            aircraft_log_probs = F.log_softmax(aircraft_logits_clamped, dim=-1)
             
             if target_action_idx < n_aircraft:
                 # AddTask(i, A)
@@ -145,11 +216,13 @@ class BCTrainer:
                 # Stop
                 log_prob = type_log_probs[2]
             
-            policy_loss = -log_prob
+            # Clamp policy loss to prevent inf (max ~10 corresponds to 1/20000 probability)
+            policy_loss = torch.clamp(-log_prob, max=20.0)
             all_policy_losses.append(policy_loss)
             
-            # Value loss: MSE
+            # Value loss: MSE with clamping for stability
             value_loss = (value - target_rewards[i]) ** 2
+            value_loss = torch.clamp(value_loss, max=1000.0)  # Prevent explosion
             all_value_losses.append(value_loss)
             
             # Accuracy: check if greedy action matches target
@@ -199,6 +272,7 @@ class BCTrainer:
         total_value_loss = 0.0
         total_accuracy = 0.0
         n_batches = 0
+        global_step = (epoch - 1) * len(dataloader)
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
         
@@ -227,12 +301,27 @@ class BCTrainer:
             total_value_loss += metrics['value_loss']
             total_accuracy += metrics['accuracy']
             n_batches += 1
+            global_step += 1
             
             # Update progress bar
             pbar.set_postfix({
                 'loss': f"{metrics['total_loss']:.4f}",
                 'acc': f"{metrics['accuracy']:.2%}",
             })
+            
+            # Log batch metrics to wandb
+            if self.wandb_run and n_batches % self.config.log_interval == 0:
+                wandb.log({
+                    "batch/loss": metrics['total_loss'],
+                    "batch/policy_loss": metrics['policy_loss'],
+                    "batch/value_loss": metrics['value_loss'],
+                    "batch/accuracy": metrics['accuracy'],
+                    "batch/lr": self.optimizer.param_groups[0]['lr'],
+                }, step=global_step)
+            
+            # Mid-epoch checkpoint (every 500 batches)
+            if self.config.checkpoint_dir and n_batches % 500 == 0:
+                self._save_mid_epoch_checkpoint(epoch, n_batches)
         
         # Average metrics
         avg_metrics = {
@@ -284,7 +373,14 @@ class BCTrainer:
             T_max=total_steps,
         )
         
-        for epoch in range(1, self.config.n_epochs + 1):
+        # Resume from checkpoint if specified
+        start_epoch = 1
+        if self.config.resume_from:
+            start_epoch = self._load_checkpoint_for_resume(self.config.resume_from)
+            if verbose:
+                print(f"Resuming from epoch {start_epoch}")
+        
+        for epoch in range(start_epoch, self.config.n_epochs + 1):
             # Train
             train_metrics = self.train_epoch(train_loader, epoch)
             
@@ -293,20 +389,112 @@ class BCTrainer:
             self.history['value_loss'].append(train_metrics['value_loss'])
             self.history['policy_accuracy'].append(train_metrics['accuracy'])
             
+            # Log epoch metrics to wandb
+            if self.wandb_run:
+                wandb.log({
+                    "epoch": epoch,
+                    "train/loss": train_metrics['loss'],
+                    "train/policy_loss": train_metrics['policy_loss'],
+                    "train/value_loss": train_metrics['value_loss'],
+                    "train/accuracy": train_metrics['accuracy'],
+                })
+            
             if verbose:
                 print(f"Epoch {epoch}: loss={train_metrics['loss']:.4f}, "
                       f"policy_loss={train_metrics['policy_loss']:.4f}, "
                       f"value_loss={train_metrics['value_loss']:.4f}, "
                       f"accuracy={train_metrics['accuracy']:.2%}")
             
+            # Save checkpoint
+            if self.config.checkpoint_dir and epoch % self.config.checkpoint_interval == 0:
+                self._save_epoch_checkpoint(epoch)
+            
             # Evaluate
             if val_loader is not None and epoch % self.config.eval_interval == 0:
                 val_metrics = self.evaluate(val_loader)
+                
+                # Log validation metrics to wandb
+                if self.wandb_run:
+                    wandb.log({
+                        "epoch": epoch,
+                        "val/loss": val_metrics['loss'],
+                        "val/accuracy": val_metrics['accuracy'],
+                    })
+                
                 if verbose:
                     print(f"  Val: loss={val_metrics['loss']:.4f}, "
                           f"accuracy={val_metrics['accuracy']:.2%}")
         
+        # Finish wandb run
+        if self.wandb_run:
+            wandb.finish()
+        
         return self.history
+    
+    def _save_epoch_checkpoint(self, epoch: int):
+        """Save checkpoint for this epoch."""
+        import os
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        
+        checkpoint_path = os.path.join(
+            self.config.checkpoint_dir,
+            f"checkpoint_epoch_{epoch:03d}.pt"
+        )
+        
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'config': self.config,
+            'history': self.history,
+        }, checkpoint_path)
+        
+        # Also save as 'latest' for easy resume
+        latest_path = os.path.join(self.config.checkpoint_dir, "checkpoint_latest.pt")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'config': self.config,
+            'history': self.history,
+        }, latest_path)
+        
+        print(f"  Saved checkpoint: {checkpoint_path}")
+    
+    def _save_mid_epoch_checkpoint(self, epoch: int, batch: int):
+        """Save mid-epoch checkpoint for crash recovery."""
+        import os
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        
+        # Save as 'latest' for easy resume
+        latest_path = os.path.join(self.config.checkpoint_dir, "checkpoint_latest.pt")
+        torch.save({
+            'epoch': epoch,
+            'batch': batch,  # Track which batch we're at
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'config': self.config,
+            'history': self.history,
+        }, latest_path)
+        
+        print(f"  [Mid-epoch checkpoint: epoch {epoch}, batch {batch}]")
+    
+    def _load_checkpoint_for_resume(self, checkpoint_path: str) -> int:
+        """Load checkpoint for resuming training. Returns next epoch to train."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if checkpoint.get('scheduler_state_dict') and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        self.history = checkpoint.get('history', self.history)
+        
+        return checkpoint['epoch'] + 1  # Return next epoch
     
     def evaluate(
         self,

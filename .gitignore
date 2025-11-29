@@ -26,3 +26,15 @@ output/
 # Jupyter
 .ipynb_checkpoints/
 
+.env
+
+# Generated files
+data/
+checkpoints/
+logs/
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

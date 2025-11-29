@@ -7,9 +7,17 @@ Usage:
 """
 
 import argparse
+import os
 import pickle
 from pathlib import Path
 import torch
+
+# Load .env file for wandb API key
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from maintainer.core.model import MaintainerNet, ModelConfig
 from maintainer.training.dataset import BCDataset
@@ -74,6 +82,49 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to train on",
     )
+    # Checkpointing
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        help="Directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=1,
+        help="Save checkpoint every N epochs",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from (or 'latest' for checkpoint_latest.pt)",
+    )
+    # Wandb options
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        default=True,
+        help="Enable wandb logging (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable wandb logging",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="maintainer-v1",
+        help="Wandb project name",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Wandb run name",
+    )
     
     args = parser.parse_args()
     
@@ -98,8 +149,19 @@ def main():
     
     print(f"  {train_dataset.get_stats()['n_samples']} training samples")
     
-    # Find max aircraft for model config
+    # Find max aircraft and max sequence length for model config
     max_aircraft = max(inst.n_aircraft for inst, _ in train_data)
+    
+    # Compute max tasks from trajectories (each trajectory step adds a task)
+    max_tasks = max(len(traj) for _, traj in train_data)
+    # Add buffer for safety
+    max_tasks = int(max_tasks * 1.2)
+    # max_seq_len = 1 (global) + n_aircraft + max_tasks
+    max_seq_len = 1 + max_aircraft + max_tasks + 100  # buffer
+    
+    print(f"  Max aircraft: {max_aircraft}")
+    print(f"  Max tasks: {max_tasks}")
+    print(f"  Max sequence length: {max_seq_len}")
     
     # Create model
     model_config = ModelConfig(
@@ -107,21 +169,46 @@ def main():
         n_layers=args.n_layers,
         n_heads=8,
         max_aircraft=max(50, max_aircraft),
+        max_tasks=max_tasks,
+        max_seq_len=max_seq_len,
         n_aircraft=max_aircraft,
     )
     
     model = MaintainerNet(model_config)
     print(f"\nModel: {sum(p.numel() for p in model.parameters()):,} parameters")
     
+    # Handle resume path
+    resume_from = None
+    if args.resume:
+        if args.resume == 'latest':
+            resume_from = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
+        else:
+            resume_from = args.resume
+        if os.path.exists(resume_from):
+            print(f"\nWill resume from: {resume_from}")
+        else:
+            print(f"\nWarning: Checkpoint not found: {resume_from}, starting fresh")
+            resume_from = None
+    
     # Create trainer
+    use_wandb = args.wandb and not args.no_wandb
     train_config = TrainingConfig(
         lr=args.lr,
         batch_size=args.batch_size,
         n_epochs=args.epochs,
         device=args.device,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_interval=args.checkpoint_interval,
+        resume_from=resume_from,
+        use_wandb=use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
     
-    trainer = BCTrainer(model, train_config)
+    if use_wandb:
+        print("\nWandB logging enabled")
+    
+    trainer = BCTrainer(model, train_config, model_config=model_config)
     
     # Train
     print(f"\nTraining for {args.epochs} epochs...")

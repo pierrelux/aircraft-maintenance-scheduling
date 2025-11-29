@@ -3,7 +3,11 @@
 Generate behavior cloning training data for Maintainer.
 
 Usage:
-    python -m maintainer.scripts.generate_data --output data/train.pkl --n-instances 1000
+    # From real Deng Excel data (recommended):
+    python -m maintainer.scripts.generate_data --output data/train.pkl --excel data/Sep\ 25\ 2017\ \(Case\ Study\ 2018-2021\).xlsx
+
+    # From synthetic data (for testing only):
+    python -m maintainer.scripts.generate_data --output data/train.pkl --synthetic --n-instances 100
 """
 
 import argparse
@@ -12,6 +16,7 @@ from pathlib import Path
 
 from maintainer.training.data_gen import (
     generate_training_data,
+    generate_training_data_from_excel,
     generate_synthetic_data,
     compute_dataset_statistics,
     DataGenConfig,
@@ -29,34 +34,28 @@ def main():
         help="Output pickle file path",
     )
     parser.add_argument(
+        "--excel",
+        type=str,
+        default=None,
+        help="Path to Deng Excel file (e.g., 'Sep 25 2017 (Case Study 2018-2021).xlsx')",
+    )
+    parser.add_argument(
         "--n-instances", "-n",
         type=int,
         default=100,
         help="Number of instances to generate",
     )
     parser.add_argument(
-        "--n-aircraft-min",
+        "--max-aircraft",
         type=int,
-        default=5,
-        help="Minimum number of aircraft",
+        default=None,
+        help="Limit number of aircraft (for testing)",
     )
     parser.add_argument(
-        "--n-aircraft-max",
+        "--horizon-days",
         type=int,
-        default=10,
-        help="Maximum number of aircraft",
-    )
-    parser.add_argument(
-        "--horizon-min",
-        type=int,
-        default=180,
-        help="Minimum horizon (days)",
-    )
-    parser.add_argument(
-        "--horizon-max",
-        type=int,
-        default=365,
-        help="Maximum horizon (days)",
+        default=365 * 4,
+        help="Planning horizon in days (default: 4 years)",
     )
     parser.add_argument(
         "--seed",
@@ -67,31 +66,42 @@ def main():
     parser.add_argument(
         "--synthetic",
         action="store_true",
-        help="Use synthetic data (no Deng solver required)",
+        help="Use synthetic data (for testing only, not recommended for training)",
     )
     
     args = parser.parse_args()
     
     print("Generating training data...")
     print(f"  Instances: {args.n_instances}")
-    print(f"  Aircraft: {args.n_aircraft_min}-{args.n_aircraft_max}")
-    print(f"  Horizon: {args.horizon_min}-{args.horizon_max} days")
     
     if args.synthetic:
-        print("  Mode: Synthetic (no Deng)")
+        print("  Mode: SYNTHETIC (for testing only!)")
+        print("  WARNING: Synthetic data uses a simple heuristic, not the Deng solver.")
         data = generate_synthetic_data(
             n_instances=args.n_instances,
             seed=args.seed,
             verbose=True,
         )
-    else:
-        config = DataGenConfig(
+    elif args.excel:
+        print(f"  Mode: Real Deng data")
+        print(f"  Excel: {args.excel}")
+        print(f"  Horizon: {args.horizon_days} days")
+        if args.max_aircraft:
+            print(f"  Max aircraft: {args.max_aircraft}")
+        
+        data = generate_training_data_from_excel(
+            excel_path=args.excel,
             n_instances=args.n_instances,
-            n_aircraft_range=(args.n_aircraft_min, args.n_aircraft_max),
-            horizon_range=(args.horizon_min, args.horizon_max),
+            horizon_days=args.horizon_days,
+            max_aircraft=args.max_aircraft,
             seed=args.seed,
+            verbose=True,
         )
-        data = generate_training_data(config, use_deng=True, verbose=True)
+    else:
+        raise ValueError(
+            "Must specify either --excel <path> for real data or --synthetic for test data. "
+            "Real data is required for proper training."
+        )
     
     # Compute statistics
     stats = compute_dataset_statistics(data)

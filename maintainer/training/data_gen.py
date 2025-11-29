@@ -86,22 +86,111 @@ def generate_synthetic_schedule(instance: AMCSInstance) -> Schedule:
     return decode_cpd_to_schedule(state)
 
 
+def generate_training_data_from_excel(
+    excel_path: str,
+    n_instances: int = 100,
+    horizon_days: int = 365 * 4,  # 4 years as in original dataset
+    max_aircraft: Optional[int] = None,
+    seed: Optional[int] = None,
+    verbose: bool = True,
+) -> List[Tuple[AMCSInstance, Trajectory]]:
+    """
+    Generate training data from the real Deng Excel dataset.
+    
+    Args:
+        excel_path: Path to the Deng Excel file
+        n_instances: Number of training instances to generate (via data augmentation)
+        horizon_days: Planning horizon in days
+        max_aircraft: Limit number of aircraft (for testing)
+        seed: Random seed
+        verbose: Show progress bar
+    
+    Returns:
+        List of (instance, trajectory) pairs
+    """
+    if not DENG_AVAILABLE:
+        raise RuntimeError(
+            "Deng solver not available. Cannot generate training data from real Excel file. "
+            "Ensure aircraft_scheduler module is properly installed."
+        )
+    
+    if seed is not None:
+        random.seed(seed)
+    
+    # Load the real instance from Excel
+    from maintainer.amcs.bridge import load_from_deng_data
+    base_instance = load_from_deng_data(excel_path, max_aircraft=max_aircraft)
+    
+    if verbose:
+        print(f"Loaded instance with {base_instance.n_aircraft} aircraft, horizon={base_instance.horizon} days")
+    
+    data = []
+    
+    iterator = range(n_instances)
+    if verbose:
+        iterator = tqdm(iterator, desc="Generating training data from Deng")
+    
+    for i in iterator:
+        # For data augmentation, we can vary the horizon or use different subsets
+        # For now, use the same instance with different horizons
+        if i == 0:
+            instance = base_instance
+        else:
+            # Vary horizon slightly for augmentation
+            varied_horizon = max(180, base_instance.horizon + random.randint(-90, 90))
+            instance = AMCSInstance(
+                n_aircraft=base_instance.n_aircraft,
+                horizon=varied_horizon,
+                capacity=base_instance.capacity,
+                aircraft=base_instance.aircraft,
+                _source_data=base_instance._source_data,
+            )
+        
+        # Solve with Deng - NO silent fallback!
+        try:
+            schedule = solve_with_deng(instance)
+        except Exception as e:
+            raise RuntimeError(
+                f"Deng solver failed on instance {i}: {e}. "
+                "Not falling back to synthetic data."
+            )
+        
+        # Evaluate cost
+        cost = evaluate_schedule(instance, schedule)
+        
+        # Convert to trajectory
+        trajectory = schedule_to_trajectory(instance, schedule, cost)
+        
+        data.append((instance, trajectory))
+    
+    return data
+
+
 def generate_training_data(
     config: DataGenConfig,
     use_deng: bool = True,
     verbose: bool = True,
 ) -> List[Tuple[AMCSInstance, Trajectory]]:
     """
-    Generate training data from the Deng solver.
+    Generate training data from random synthetic instances.
+    
+    NOTE: This uses synthetic instances. For real data, use generate_training_data_from_excel().
     
     Args:
         config: Data generation configuration
-        use_deng: Whether to use Deng solver (requires real data)
+        use_deng: Whether to use Deng solver (requires real data with _source_data)
         verbose: Show progress bar
     
     Returns:
         List of (instance, trajectory) pairs
     """
+    if use_deng:
+        raise ValueError(
+            "Cannot use Deng solver with synthetic instances. "
+            "Either use generate_training_data_from_excel() with real Excel data, "
+            "or set use_deng=False to use synthetic heuristic."
+        )
+    
     if config.seed is not None:
         random.seed(config.seed)
     
@@ -109,7 +198,7 @@ def generate_training_data(
     
     iterator = range(config.n_instances)
     if verbose:
-        iterator = tqdm(iterator, desc="Generating training data")
+        iterator = tqdm(iterator, desc="Generating synthetic training data")
     
     for _ in iterator:
         # Generate random instance
@@ -123,15 +212,8 @@ def generate_training_data(
             capacity=capacity,
         )
         
-        # Solve with Deng or synthetic
-        if use_deng and DENG_AVAILABLE:
-            try:
-                schedule = solve_with_deng(instance)
-            except (ValueError, NotImplementedError):
-                # Fall back to synthetic if Deng can't run on this instance
-                schedule = generate_synthetic_schedule(instance)
-        else:
-            schedule = generate_synthetic_schedule(instance)
+        # Use synthetic heuristic
+        schedule = generate_synthetic_schedule(instance)
         
         # Evaluate cost
         cost = evaluate_schedule(instance, schedule)
