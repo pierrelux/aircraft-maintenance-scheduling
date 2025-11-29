@@ -132,16 +132,31 @@ def main():
     with open(args.data, 'rb') as f:
         train_bundle = pickle.load(f)
     
-    train_data = train_bundle['data']
-    print(f"  Loaded {len(train_data)} training instances")
+    all_data = train_bundle['data']
+    print(f"  Loaded {len(all_data)} total instances")
     
-    # Load validation data if provided
+    # Load separate validation data if provided, otherwise split
     val_data = None
     if args.val_data:
         with open(args.val_data, 'rb') as f:
             val_bundle = pickle.load(f)
         val_data = val_bundle['data']
-        print(f"  Loaded {len(val_data)} validation instances")
+        train_data = all_data
+        print(f"  Using separate validation set: {len(val_data)} instances")
+    else:
+        # Auto train/val split (80/20)
+        import random
+        random.seed(42)  # Reproducible split
+        indices = list(range(len(all_data)))
+        random.shuffle(indices)
+        split_idx = int(len(all_data) * 0.8)
+        
+        train_indices = indices[:split_idx]
+        val_indices = indices[split_idx:]
+        
+        train_data = [all_data[i] for i in train_indices]
+        val_data = [all_data[i] for i in val_indices]
+        print(f"  Auto split: {len(train_data)} train, {len(val_data)} val (80/20)")
     
     # Create datasets
     train_dataset = BCDataset(train_data, normalize_rewards=True)

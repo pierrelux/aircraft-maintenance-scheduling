@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=maintainer-train
 #SBATCH --partition=long
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
@@ -31,7 +31,7 @@ LOG_DIR="${PROJECT_DIR}/logs"
 EXCEL_FILE="${DATA_DIR}/Sep 25 2017 (Case Study 2018-2021).xlsx"
 
 # Training hyperparameters
-N_TRAIN_INSTANCES=100
+N_TRAIN_INSTANCES=500  # Increased for better generalization
 N_EVAL_INSTANCES=50
 EPOCHS=50
 BATCH_SIZE=32
@@ -95,8 +95,9 @@ cd "${PROJECT_DIR}"
 # Generate training data from Deng Excel dataset
 echo ""
 echo "[4/6] Generating training data..."
-if [ -f "${DATA_DIR}/train_deng.pkl" ]; then
-    echo "  Training data already exists, skipping generation..."
+TRAIN_DATA="${DATA_DIR}/train_deng_${N_TRAIN_INSTANCES}.pkl"
+if [ -f "${TRAIN_DATA}" ]; then
+    echo "  Training data already exists: ${TRAIN_DATA}"
 else
     if [ ! -f "${EXCEL_FILE}" ]; then
         echo "  ERROR: Deng Excel file not found: ${EXCEL_FILE}"
@@ -105,7 +106,7 @@ else
     fi
     echo "  Generating ${N_TRAIN_INSTANCES} instances from Deng Excel data..."
     python -m maintainer.scripts.generate_data \
-        --output "${DATA_DIR}/train_deng.pkl" \
+        --output "${TRAIN_DATA}" \
         --excel "${EXCEL_FILE}" \
         --n-instances ${N_TRAIN_INSTANCES}
 fi
@@ -126,7 +127,7 @@ if [ -f "${CHECKPOINT_DIR}/checkpoint_latest.pt" ]; then
 fi
 
 python -m maintainer.scripts.train \
-    --data "${DATA_DIR}/train_deng.pkl" \
+    --data "${TRAIN_DATA}" \
     --output "${CHECKPOINT_DIR}/model.pt" \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \

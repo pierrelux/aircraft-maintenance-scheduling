@@ -29,7 +29,7 @@ class TrainingConfig:
     """Configuration for training."""
     # Optimization
     lr: float = 1e-4
-    weight_decay: float = 0.01
+    weight_decay: float = 0.1  # Increased for regularization
     batch_size: int = 32
     n_epochs: int = 100
     grad_clip: float = 1.0
@@ -48,6 +48,10 @@ class TrainingConfig:
     checkpoint_dir: Optional[str] = None
     checkpoint_interval: int = 1  # Save every N epochs
     resume_from: Optional[str] = None  # Path to checkpoint to resume from
+    
+    # Early stopping
+    early_stopping_patience: int = 5  # Stop if val loss doesn't improve for N epochs
+    early_stopping_min_delta: float = 0.001  # Minimum improvement to count as progress
     
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -380,6 +384,10 @@ class BCTrainer:
             if verbose:
                 print(f"Resuming from epoch {start_epoch}")
         
+        # Early stopping state
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
         for epoch in range(start_epoch, self.config.n_epochs + 1):
             # Train
             train_metrics = self.train_epoch(train_loader, epoch)
@@ -409,8 +417,8 @@ class BCTrainer:
             if self.config.checkpoint_dir and epoch % self.config.checkpoint_interval == 0:
                 self._save_epoch_checkpoint(epoch)
             
-            # Evaluate
-            if val_loader is not None and epoch % self.config.eval_interval == 0:
+            # Evaluate on validation set every epoch (important for early stopping)
+            if val_loader is not None:
                 val_metrics = self.evaluate(val_loader)
                 
                 # Log validation metrics to wandb
@@ -424,6 +432,23 @@ class BCTrainer:
                 if verbose:
                     print(f"  Val: loss={val_metrics['loss']:.4f}, "
                           f"accuracy={val_metrics['accuracy']:.2%}")
+                
+                # Early stopping check
+                if val_metrics['loss'] < best_val_loss - self.config.early_stopping_min_delta:
+                    best_val_loss = val_metrics['loss']
+                    patience_counter = 0
+                    # Save best model
+                    if self.config.checkpoint_dir:
+                        self._save_best_checkpoint(epoch, val_metrics['loss'])
+                else:
+                    patience_counter += 1
+                    if verbose:
+                        print(f"  Early stopping: {patience_counter}/{self.config.early_stopping_patience}")
+                    
+                    if patience_counter >= self.config.early_stopping_patience:
+                        if verbose:
+                            print(f"\nEarly stopping triggered at epoch {epoch}")
+                        break
         
         # Finish wandb run
         if self.wandb_run:
@@ -481,6 +506,24 @@ class BCTrainer:
         }, latest_path)
         
         print(f"  [Mid-epoch checkpoint: epoch {epoch}, batch {batch}]")
+    
+    def _save_best_checkpoint(self, epoch: int, val_loss: float):
+        """Save the best model based on validation loss."""
+        import os
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        
+        best_path = os.path.join(self.config.checkpoint_dir, "checkpoint_best.pt")
+        torch.save({
+            'epoch': epoch,
+            'val_loss': val_loss,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'config': self.config,
+            'history': self.history,
+        }, best_path)
+        
+        print(f"  [New best model: val_loss={val_loss:.4f}]")
     
     def _load_checkpoint_for_resume(self, checkpoint_path: str) -> int:
         """Load checkpoint for resuming training. Returns next epoch to train."""

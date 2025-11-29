@@ -30,7 +30,7 @@ class ModelConfig:
     # Transformer config
     n_layers: int = 6
     n_heads: int = 8
-    dropout: float = 0.1
+    dropout: float = 0.2  # Increased for regularization
     
     # For the actual number of aircraft (set at runtime)
     n_aircraft: int = 10
