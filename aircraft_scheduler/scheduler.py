@@ -748,13 +748,150 @@ class Scheduler:
         
         return ScheduleResult(
             checks=checks,
-            total_a_checks=best[4],
-            total_c_checks=best[3],
+            total_a_checks=cum_a,
+            total_c_checks=cum_c,
             total_d_checks=0,
             computation_time=computation_time,
             total_unused_fh=total_unused_fh,
             total_tolerance_penalty=total_penalty,
-            total_tolerance_events=best[2],
+            total_tolerance_events=cum_tol,
+        )
+
+    def schedule_adp(
+        self,
+        planning_days: int,
+        verbose: bool = False,
+        n_sample: int = 20,
+        t_l: int = 183,
+        t_h: int = 1461,
+        lambda_extra: float = 1e5,
+        xi_waste: float = 1e20,
+        gamma: float = 1.0,
+        r_lb_a: float = 21,
+        r_lb_c: float = 210,
+        util_cv: float = 0.3,
+        seed: int = 42,
+    ) -> ScheduleResult:
+        """
+        Schedule using Lookahead ADP (Deng & Santos 2021, EJOR 299(3):814-833).
+
+        Sequential single-state decisions: at each day, the C-check action
+        is chosen with a deterministic thrifty-policy forecast (horizon
+        t_h) and the A-check action with a Monte-Carlo forecast
+        (n_sample paths, horizon t_l), per the paper's Algorithm 1. See
+        aircraft_scheduler/adp.py for the full description and the
+        documented adaptations to this dataset.
+
+        The defaults match the paper (Table 7): lambda=1e5, xi=1e20,
+        gamma=1, R_lb = 21/210 days, t_l=183, t_h=1461. The paper uses
+        n_sample=50; 20 is the default here for practical Python
+        runtimes.
+
+        Args:
+            planning_days: Planning horizon in days
+            verbose: Print progress
+            n_sample: Monte-Carlo sample paths for the A-check forecast
+            t_l: Stochastic lookahead horizon for A-checks (days)
+            t_h: Deterministic lookahead horizon for C-checks (days)
+            lambda_extra: Cost of one extra maintenance slot (paper: 1e5)
+            xi_waste: Penalty for wasting an available slot (paper: 1e20)
+            gamma: Discount factor (paper: 1)
+            r_lb_a: A-check eligibility threshold, days remaining (paper: 21)
+            r_lb_c: C-check eligibility threshold, days remaining (paper: 210)
+            util_cv: Coefficient of variation assumed for daily FH/FC in
+                the stochastic forecast (no daily history in this dataset)
+            seed: RNG seed for the Monte-Carlo forecasts (reproducible)
+
+        Returns:
+            ScheduleResult with full schedule (same KPIs as other variants)
+        """
+        start_time = time.time()
+        start_date = self.data.config.begin_day
+        tails = self.data.aircraft_tails
+        n = self.n_aircraft
+
+        # Import ADP components (local to avoid a module import cycle)
+        from .adp import LookaheadADPScheduler
+
+        if verbose:
+            print(f"[ADP] Starting Lookahead ADP (Deng & Santos 2021) for {planning_days} days")
+            print(f"[ADP] Fleet: {n} aircraft | n_sample={n_sample} t_l={t_l} t_h={t_h} "
+                  f"lambda={lambda_extra:.0e} xi={xi_waste:.0e} gamma={gamma} "
+                  f"R_lb=({r_lb_a:g},{r_lb_c:g}) cv={util_cv} seed={seed}")
+            sys.stdout.flush()
+
+        # Seasonal mean daily utilization (DFH/DFC sheets) for the
+        # stochastic forecast: seasonal_fh[i, m] for month m (0-based).
+        seasonal_fh = np.array(
+            [self.data.flight_rates[t].dfh[m] for t in tails for m in range(1, 13)],
+            dtype=np.float64,
+        ).reshape(n, 12)
+        seasonal_fc = np.array(
+            [self.data.flight_rates[t].dfc[m] for t in tails for m in range(1, 13)],
+            dtype=np.float64,
+        ).reshape(n, 12)
+
+        # Empirical C-check TAT options per aircraft (5 values each, as in
+        # the C_ELAPSED_TIME sheet); fall back to the default C_E_T.
+        c_e_t = float(self.data.config.c_e_t)
+        c_tat_options = np.array(
+            [
+                (self.data.c_check_info[t].elapsed_times + [c_e_t] * 5)[:5]
+                if t in self.data.c_check_info
+                else [c_e_t] * 5
+                for t in tails
+            ],
+            dtype=np.float64,
+        )
+
+        adp = LookaheadADPScheduler(
+            static=self.static,
+            initial_state=self.initial_state,
+            max_c=self.max_c,
+            max_a=self.max_a,
+            lambda_extra=lambda_extra,
+            xi_waste=xi_waste,
+            gamma=gamma,
+            r_lb_a=r_lb_a,
+            r_lb_c=r_lb_c,
+            t_l=t_l,
+            t_h=t_h,
+            n_sample=n_sample,
+            util_cv=util_cv,
+            seasonal_fh=seasonal_fh,
+            seasonal_fc=seasonal_fc,
+            c_tat_options=c_tat_options,
+            start_month=start_date.month,
+            seed=seed,
+        )
+
+        # Reporting uses the same Eq. 28 penalties as every other variant,
+        # so the resulting KPIs are directly comparable.
+        def report_cost(state, c_mask, a_mask):
+            return compute_check_cost(state, self.static, c_mask, a_mask, self.p_a, self.p_d)
+
+        outcome = adp.schedule(planning_days, verbose=verbose, report_cost_fn=report_cost)
+
+        checks = self._history_to_checks(outcome["history"], start_date, tails)
+        total_unused_fh = sum(c.total_unused_fh for c in checks)
+        total_penalty = max(0.0, float(outcome["cum_cost"]) - float(total_unused_fh))
+        computation_time = time.time() - start_time
+
+        if verbose:
+            print(f"[ADP] Complete in {computation_time:.1f}s")
+            print(f"[ADP] C-checks: {outcome['cum_c']}, A-checks: {outcome['cum_a']}, "
+                  f"Tolerance: {outcome['cum_tol']}")
+            sys.stdout.flush()
+
+        return ScheduleResult(
+            checks=checks,
+            total_a_checks=outcome["cum_a"],
+            total_c_checks=outcome["cum_c"],
+            total_d_checks=0,
+            computation_time=computation_time,
+            total_unused_fh=total_unused_fh,
+            total_tolerance_penalty=total_penalty,
+            total_tolerance_events=outcome["cum_tol"],
         )
 
     def schedule_greedy(

@@ -134,6 +134,24 @@ def run_variant(variant: str, years: int, beam_width: int, data_path: str | None
         result = sched.schedule(planning_days, verbose=True)
         return f"Full variant (λ={DEFAULT_LAMBDA_FUTURE:g})", summarize_result(result)
 
+    if variant == "adp":
+        sched = Scheduler(data, beam_width=beam_width, u=100.0)
+        result = sched.schedule_adp(
+            planning_days,
+            verbose=True,
+            n_sample=20,       # paper uses 50; 20 keeps the Python runtime sane
+            t_l=183,           # paper Table 7
+            t_h=1461,          # paper Table 7
+            lambda_extra=1e5,  # paper Table 7
+            xi_waste=1e20,     # paper Table 7
+            gamma=1.0,         # paper Table 7
+            r_lb_a=21,         # paper Table 7
+            r_lb_c=210,        # paper Table 7
+            util_cv=0.3,
+            seed=42,
+        )
+        return "ADP (Deng & Santos 2021)", summarize_result(result)
+
     raise ValueError(f"Unknown variant: {variant}")
 
 
@@ -143,7 +161,7 @@ def main() -> None:
         "--variant",
         type=str,
         required=True,
-        choices=["greedy", "deng", "local", "future", "diversity", "full", "all"],
+        choices=["greedy", "deng", "local", "future", "diversity", "full", "adp", "all"],
     )
     parser.add_argument("--years", type=int, default=4)
     parser.add_argument("--beam-width", type=int, default=200)
@@ -154,7 +172,7 @@ def main() -> None:
     out_path = Path(args.out)
     payload = load_existing(out_path)
 
-    order = ["greedy", "deng", "local", "future", "diversity", "full"]
+    order = ["greedy", "deng", "local", "future", "diversity", "full", "adp"]
     targets = order if args.variant == "all" else [args.variant]
 
     for v in targets:

@@ -85,6 +85,12 @@ from .visualization import (
     plot_tolerance_analysis,
 )
 
+from .adp import (
+    LookaheadADPScheduler,
+    thrifty_rollout,
+    remaining_utilization_days,
+)
+
 __version__ = "2.0.0"
 __all__ = [
     # Data
